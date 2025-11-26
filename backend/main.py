@@ -1,74 +1,64 @@
-import pandas as pd
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from __future__ import annotations
+
 import uuid
+from typing import Any, Dict, Optional, List
 
-from data_utils import load_saas_df
-from llm_planner import build_plan_from_prompt
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from data_utils import load_dataset, build_schema
 from executor import execute_plan
-from models import Transform  # NEW
+from llm_planner import build_plan_from_prompt
 
+app = FastAPI(title="Natural-language Viz Backend", version="2.0")
 
-app = FastAPI()
-df = load_saas_df()
+# Allow local dev from any origin by default; tighten if needed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-print("Loaded SaaS dataframe:")
-print(df[["Company Name", "Founded Year", "Valuation", "Valuation_num"]].head())
-print(df["Valuation_num"].describe())
+# Load data & schema at startup (for this example, single CSV).
+df = load_dataset()
+schema = build_schema(df)
 
 
 class VizRequest(BaseModel):
     prompt: str
+    current_viz: Optional[Dict[str, Any]] = None
     target_viz_id: Optional[str] = None
-    current_viz: Optional[Dict[str, Any]] = None  # spec of viz to tweak
 
 
-@app.get("/health")
-def health_check():
+@app.get("/api/health")
+def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/api/visualize")
-def visualize(req: VizRequest):
+def visualize(req: VizRequest) -> Dict[str, Any]:
+    """Main entry point: turn a NL prompt into a visualization spec + data.
+
+    This endpoint is intentionally generic:
+    - It knows nothing about the specific columns in the CSV.
+    - All semantics (which columns to use, which transforms to apply)
+      come from the LLM, which sees a JSON schema of the dataframe.
+    """
     plan = build_plan_from_prompt(
         user_prompt=req.prompt,
+        schema=schema,
         current_viz=req.current_viz,
         target_viz_id=req.target_viz_id,
     )
 
-    lower_prompt = req.prompt.lower()
-
-    # Investor frequency heuristic
-    if "investor" in lower_prompt and (
-        "frequen" in lower_prompt
-        or "most common" in lower_prompt
-        or "most often" in lower_prompt
-        or "appear most" in lower_prompt
-    ):
-        plan.chart.viz_type = "table"
-        plan.chart.transforms = [
-            Transform(op="investor_frequency"),
-            Transform(op="sort", by=["Company_Count"], order="desc"),
-        ]
-        if not plan.chart.style.title:
-            plan.chart.style.title = "Top investors by number of companies"
-
-    # ARR–Valuation correlation heuristic
-    if "correlation" in lower_prompt and "arr" in lower_prompt and "valuation" in lower_prompt:
-        plan.chart.viz_type = "scatter"
-        plan.chart.encoding.x = "ARR_num"
-        plan.chart.encoding.y = "Valuation_num"
-        if not plan.chart.style.title:
-            plan.chart.style.title = "Correlation between ARR and Valuation"
-
     result = execute_plan(df, plan)
 
-    if result["action"] == "new_visualization":
+    # Assign a viz_id for frontend to track multiple visualizations
+    if result.get("action") == "new_visualization":
         result["viz_id"] = str(uuid.uuid4())
     else:
         result["viz_id"] = req.target_viz_id
 
     return result
-
-

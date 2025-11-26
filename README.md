@@ -1,4 +1,4 @@
-# Natural Language Visualization App – Top 100 SaaS Companies (2025)
+# LLM based Visualization App – Top 100 SaaS Companies (2025)
 
 This is a small full-stack project that lets users create data visualizations
 (pie charts, scatter plots, tables, etc.) over the **Top 100 SaaS Companies 2025**
@@ -17,7 +17,7 @@ The dataset `top_100_saas_companies_2025.csv` is included under `backend/`.
 
 - Python 3.10+
 - Node.js 18+ (with npm or yarn)
-- An OpenAI API key with access to `gpt-5.1-mini` (or adjust the model in
+- An OpenAI API key with access to `gpt-5.1` (or adjust the model in
   `backend/llm_planner.py`)
 
 Set your API key in the environment:

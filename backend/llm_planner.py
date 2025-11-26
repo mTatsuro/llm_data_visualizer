@@ -1,300 +1,252 @@
+from __future__ import annotations
+
 import json
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
+
 from openai import OpenAI
+
+from config import OPENAI_MODEL
 from models import LLMPlan
 
-client = OpenAI()  # expects OPENAI_API_KEY in environment
+client = OpenAI()
 
 SYSTEM_PROMPT = """
-You are a data visualization planner for a SaaS companies dataset.
+You are a data visualization planner.
 
-Columns:
-- Company Name (string)
-- Founded Year (integer)
-- HQ (string)
-- Industry (string)
-- Total Funding (string, parsed numeric column: Total_Funding_num)
-- ARR (string, parsed numeric column: ARR_num)
-- Valuation (string, parsed numeric column: Valuation_num)
-- Employees (string, parsed numeric column: Employees_num)
-- Top Investors (string with comma-separated investors)
-- Product (string)
-- G2 Rating (float)
+You receive, as a single JSON object:
+- "schema": a list describing the dataset columns (name, kind, examples)
+- "user_prompt": the user's natural language request
+- "current_viz": the current visualization (if any), in the SAME shape that you output
+- "target_viz_id": the id of the visualization the user is interacting with (may be null)
 
-Your job:
-1. Read the user's natural language request.
-2. Decide the best visualization type (pie, bar, scatter, table).
-3. Describe the necessary data transforms (groupby, aggregations, etc.).
-4. Define encodings: which columns go to x, y, label, value, tooltip.
-5. Optionally adjust style (color, header_bold, title).
-6. If the user is only asking to change visual style of an existing chart,
-   set action="update_visualization" and keep the same transforms/encodings.
-7. To build a frequency table of investors, you can use the op "investor_frequency"
-   which explodes "Top Investors" into individual investors and returns columns:
-   "Investor" and "Company_Count".
+Your job is to produce a SINGLE JSON object describing how to visualize the data.
 
-IMPORTANT:
-- Always respond with a SINGLE valid JSON object.
-- Do NOT include any backticks or markdown code fences.
-- The JSON must have exactly these top-level keys: action, target_viz_id, chart.
-- For action, use "new_visualization" or "update_visualization".
-- For chart.viz_type, use one of: "pie", "bar", "scatter", "table".
+====================================================
+1. SCHEMA & COLUMNS
+====================================================
+
+Treat the schema as the source of truth.
+
+- Every column you mention MUST be exactly one of the "name" fields from the schema.
+- Do NOT invent new column names.
+- Use the "kind" and "examples" to decide which column best matches phrases like
+  "number of employees", "valuation", "ARR", etc.
+- Many datasets will have both raw string columns and parsed numeric variants such as
+  "Valuation" (string) and "Valuation_num" (number). For numeric operations (scatter,
+  correlation, aggregation) prefer the numeric versions.
+
+====================================================
+2. OUTPUT SHAPE (ALWAYS)
+====================================================
+
+You must always return ONE JSON object of this shape:
+
+{
+  "action": "new_visualization" | "update_visualization",
+  "target_viz_id": null or string,
+  "chart": {
+    "viz_type": "pie" | "bar" | "scatter" | "table",
+    "transforms": [
+      {
+        "op": "groupby" | "sort" | "select" | "filter" | "value_counts",
+        "by": [string] | null,
+        "order": "asc" | "desc" | null,
+        "columns": [string] | null,
+        "filter_expr": string | null,
+        "aggregations": [
+          {
+            "column": string,
+            "agg": "count" | "sum" | "mean" | "max" | "min",
+            "new_column": string
+          }
+        ] | null,
+        "column": string | null,
+        "delimiter": string | null,
+        "top_n": integer | null
+      }
+    ],
+    "encoding": {
+      "x": string | null,
+      "y": string | null,
+      "label": string | null,
+      "value": string | null,
+      "color": string | null,
+      "tooltip": [string] | null
+    },
+    "style": {
+      "title": string | null,
+      "color": string | null,
+      "header_bold": boolean | null
+    }
+  }
+}
+
+- Do NOT wrap this in backticks.
+- Do NOT add explanations or comments.
+- Fill in ALL fields that are relevant; leave others as null or empty lists.
+
+====================================================
+3. CHOOSING viz_type AND ENCODING
+====================================================
+
+General guidance:
+
+- PIE:
+  - Use when showing a breakdown of a categorical column.
+  - encoding.label = category column (kind "string" or low-cardinality).
+  - encoding.value = numeric column (count or sum). If doing counts, either:
+    - add a groupby + aggregation, OR
+    - use value_counts (see below) and set encoding.value to the resulting count column.
+
+- BAR:
+  - Use when comparing values across categories (e.g. "top 10 investors by count").
+
+- SCATTER:
+  - Use when the user asks about a relationship or correlation between two numeric columns.
+  - encoding.x and encoding.y MUST both be numeric columns (kind "number" or "integer").
+  - Add informative columns to encoding.tooltip.
+
+- TABLE:
+  - Use when the user explicitly wants to "see a table", "list", or "show details".
+  - For "which X appear most frequently", use op "value_counts":
+    {
+      "op": "value_counts",
+      "column": "<column name containing the items>",
+      "delimiter": ","   // if the cell contains comma-separated lists
+    }
+
+CORRELATION:
+- For prompts like "correlation of ARR and valuation" or "relationship between number
+  of employees and valuation", use viz_type "scatter" and choose the appropriate numeric
+  columns from the schema (e.g. "ARR_num", "Valuation_num", "Employees_num").
+
+====================================================
+4. TRANSFORMS (DATA OPERATIONS)
+====================================================
+
+Use these generically for ANY dataset:
+
+- groupby:
+  {
+    "op": "groupby",
+    "by": ["CategoryColumn"],
+    "aggregations": [
+      {"column": "SomeNumericColumn", "agg": "sum", "new_column": "Total_SomeNumericColumn"}
+    ]
+  }
+
+- sort:
+  {
+    "op": "sort",
+    "by": ["SomeColumn"],
+    "order": "desc"
+  }
+
+- select:
+  {
+    "op": "select",
+    "columns": ["Col1", "Col2", "Col3"]
+  }
+
+- filter:
+  {
+    "op": "filter",
+    "filter_expr": "SomeNumericColumn > 1000"
+  }
+
+- value_counts:
+  {
+    "op": "value_counts",
+    "column": "<column name>",
+    "delimiter": "," | null,
+    "top_n": 20 | null
+  }
+
+====================================================
+5. HANDLING FOLLOW-UP PROMPTS & UPDATES
+====================================================
+
+The user payload includes "current_viz". It has the SAME shape as the plan you output:
+{
+  "action": "...",
+  "target_viz_id": "...",
+  "chart": { ... }
+}
+
+Use it to support conversational edits.
+
+- If current_viz is empty or null:
+  - Treat the request as asking for a NEW visualization.
+  - Set "action": "new_visualization".
+
+- If current_viz is present and the user is clearly asking to MODIFY the existing chart
+  (e.g. "change the color to light blue", "make the header row bold",
+  "switch this to a bar chart", "change x axis to ARR"):
+  - Set "action": "update_visualization".
+  - Base your new "chart" on current_viz["chart"], modifying ONLY what the user requested.
+    - For simple style tweaks:
+      - Keep the same viz_type, transforms, and encoding.
+      - Copy style from current_viz and update only the relevant fields:
+        - style.color (e.g. "lightblue")
+        - style.header_bold = true/false
+        - style.title, etc.
+    - For encoding tweaks:
+      - Keep transforms unchanged.
+      - Copy encoding from current_viz and modify only the relevant fields (e.g. x, y, label).
+    - For explicit viz_type changes:
+      - Use the requested viz_type but reuse encoding/transforms where it makes sense.
+
+- For updates, you must still output a FULL chart object (viz_type, transforms,
+  encoding, style), not just the fields that changed.
+
+- If the user's wording is ambiguous, prefer treating it as an UPDATE when
+  current_viz is present and the prompt says things like "change", "modify", "tweak",
+  "update", "make the header bold", "change the color", etc.
+
+====================================================
+6. JSON ONLY
+====================================================
+
+Always respond with exactly one valid JSON object conforming to the structure above.
+No markdown, no comments, no natural language explanation.
 """
 
-
-def _extract_field(v: Any) -> Any:
-    """
-    Extract column/field name from a Vega-Lite-style encoding object, or return as-is.
-    """
-    if isinstance(v, dict):
-        return v.get("field") or v.get("column") or v.get("name")
-    return v
-
-
-def _normalize_llm_json(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize whatever JSON the model produced into the schema expected by LLMPlan.
-    This makes the system robust to small schema drift, Vega-Lite-ish encodings, etc.
-    """
-
-    # ---- action ----
-    action = data.get("action") or "new_visualization"
-    if action not in ("new_visualization", "update_visualization"):
-        # Map common synonyms
-        lower = str(action).lower()
-        if "update" in lower or "modify" in lower or "tweak" in lower:
-            action = "update_visualization"
-        else:
-            action = "new_visualization"
-    data["action"] = action
-
-    # ---- chart ----
-    chart = data.get("chart") or {}
-    data["chart"] = chart
-
-    # viz_type
-    viz_type = chart.get("viz_type") or chart.get("type") or chart.get("mark")
-    if isinstance(viz_type, dict):
-        viz_type = viz_type.get("type") or viz_type.get("name")
-
-    if isinstance(viz_type, str):
-        lt = viz_type.lower()
-        if lt in ("arc", "pie", "donut"):
-            viz_type = "pie"
-        elif lt in ("point", "circle", "square", "scatter"):
-            viz_type = "scatter"
-        elif lt in ("bar", "column"):
-            viz_type = "bar"
-        elif lt in ("table", "tabular", "grid"):
-            viz_type = "table"
-        else:
-            # Fallback
-            viz_type = lt
-    else:
-        viz_type = "table"
-
-    chart["viz_type"] = viz_type
-
-    # ---- transforms ----
-    raw_transforms: List[Any] = (
-        chart.get("transforms")
-        or chart.get("dataTransforms")
-        or chart.get("transform")
-        or []
-    )
-
-    norm_transforms = []
-    for t in raw_transforms:
-        if not isinstance(t, dict):
-            continue
-
-        op = t.get("op") or t.get("operation") or t.get("type")
-
-        # Map common variants
-        if not op:
-            desc = (t.get("name", "") + " " + t.get("description", "")).lower()
-            if "investor" in desc:
-                op = "investor_frequency"
-
-        if isinstance(op, str):
-            lo = op.lower()
-            if lo in ("aggregate", "group_by", "groupby", "group"):
-                op = "groupby"
-            elif lo in ("sort", "order", "orderby"):
-                op = "sort"
-            elif lo in ("select", "project"):
-                op = "select"
-            elif lo in ("filter", "where"):
-                op = "filter"
-            elif lo in ("investor_frequency",):
-                op = "investor_frequency"
-        else:
-            # Skip unknown transform types
-            continue
-
-        norm: Dict[str, Any] = {
-            "op": op,
-        }
-
-        # Groupby / sort / select / filter metadata
-        norm["by"] = (
-            t.get("by")
-            or t.get("groupby")
-            or t.get("group_by")
-            or t.get("group")
-        )
-        norm["order"] = t.get("order") or t.get("sort_order")
-        norm["columns"] = t.get("columns") or t.get("fields") or t.get("select")
-        norm["filter_expr"] = (
-            t.get("filter_expr") or t.get("expr") or t.get("condition")
-        )
-
-        # Aggregations: try to map from Vega-Lite style
-        raw_aggs = (
-            t.get("aggregations")
-            or t.get("aggregates")
-            or t.get("aggregate")
-            or t.get("fields")
-            or []
-        )
-
-        norm_aggs = []
-        if isinstance(raw_aggs, list):
-            for a in raw_aggs:
-                if not isinstance(a, dict):
-                    continue
-                agg_func = (
-                    a.get("agg")
-                    or a.get("op")
-                    or a.get("operation")
-                    or a.get("func")
-                )
-                new_col = (
-                    a.get("new_column")
-                    or a.get("as")
-                    or a.get("alias")
-                    or a.get("name")
-                )
-                col = a.get("column") or a.get("field")
-                if agg_func and col and new_col:
-                    norm_aggs.append(
-                        {
-                            "column": col,
-                            "agg": agg_func,
-                            "new_column": new_col,
-                        }
-                    )
-        if norm_aggs:
-            norm["aggregations"] = norm_aggs
-
-        norm_transforms.append(norm)
-
-    chart["transforms"] = norm_transforms
-
-    # ---- encoding ----
-    enc = chart.get("encoding") or {}
-
-    # Handle Vega-Lite style encodings: x: {field: "ARR_num", type: "quantitative"}
-    for key in ("x", "y", "label", "value"):
-        if key in enc:
-            enc[key] = _extract_field(enc[key])
-
-    # Special handling for pie charts where the model may use
-    # theta/color instead of label/value.
-    if chart["viz_type"] == "pie":
-        # Label: what each slice represents (category)
-        if not enc.get("label"):
-            if "color" in enc:
-                enc["label"] = _extract_field(enc["color"])
-            elif "category" in enc:
-                enc["label"] = _extract_field(enc["category"])
-            else:
-                # Fallback: try groupby columns from transforms
-                for t in chart.get("transforms", []):
-                    if t.get("op") == "groupby" and t.get("by"):
-                        enc["label"] = t["by"][0]
-                        break
-
-        # Value: size of each slice
-        if not enc.get("value"):
-            if "theta" in enc:
-                enc["value"] = _extract_field(enc["theta"])
-            elif "size" in enc:
-                enc["value"] = _extract_field(enc["size"])
-            else:
-                # Fallback: use the first aggregation's new_column
-                for t in chart.get("transforms", []):
-                    for agg in t.get("aggregations", []):
-                        enc["value"] = agg.get("new_column") or agg.get("column")
-                        break
-                    if enc.get("value"):
-                        break
-
-    # Tooltip: list of fields or objects-with-field
-    if "tooltip" in enc and isinstance(enc["tooltip"], list):
-        enc["tooltip"] = [_extract_field(t) for t in enc["tooltip"]]
-
-    chart["encoding"] = enc
-
-    # Tooltip: list of fields or objects-with-field
-    if "tooltip" in enc and isinstance(enc["tooltip"], list):
-        enc["tooltip"] = [_extract_field(t) for t in enc["tooltip"]]
-
-    chart["encoding"] = enc
-
-    # ---- style ----
-    style = chart.get("style") or {}
-    chart["style"] = style
-
-    return data
 
 
 def build_plan_from_prompt(
     user_prompt: str,
+    schema: List[Dict[str, Any]],
     current_viz: Optional[Dict[str, Any]] = None,
     target_viz_id: Optional[str] = None,
 ) -> LLMPlan:
+    """Call the model to obtain a structured visualization plan.
+
+    This function is dataset-agnostic: the only things it sees are the user's
+    prompt and the generic schema.
+    """
+    user_payload = {
+        "schema": schema,
+        "user_prompt": user_prompt,
+        "current_viz": current_viz or {},
+        "target_viz_id": target_viz_id,
+    }
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "User prompt: "
-                + user_prompt
-                + "\n\n"
-                + "Current visualization spec (JSON or empty object): "
-                + json.dumps(current_viz or {})
-                + "\nTarget viz id: "
-                + (target_viz_id or "null")
-            ),
-        },
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
 
-    # NOTE: older OpenAI Python SDKs don't support response_format here, so we
-    # just ask for JSON in the prompt and parse it ourselves.
-    resp = client.responses.create(
-        model="gpt-5.1",
-        input=messages,
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=0,
     )
 
-    # Extract text output robustly
+    content = response.choices[0].message.content
     try:
-        raw = resp.output[0].content[0].text
-    except Exception:
-        raw = str(resp)
+        data = json.loads(content)
+    except Exception as exc:  # pragma: no cover - very unlikely with json_object mode
+        raise ValueError(f"Model did not return valid JSON: {content}") from exc
 
-    text = raw.strip()
-    # Strip possible ```json ... ``` fences if the model ignored instructions
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        if lines and lines[0].strip().lower().startswith("json"):
-            lines = lines[1:]
-        text = "\n".join(lines).strip()
-
-    data = json.loads(text)
-    data = _normalize_llm_json(data)
     return LLMPlan.model_validate(data)
